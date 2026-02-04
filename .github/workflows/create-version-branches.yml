@@ -48,7 +48,7 @@ jobs:
             fi
 
             # Remove GitHub Actions workflow
-            rm -r .github/workflows
+            rm .github/workflows/create-version-branches.yml
 
             # Remove .cnb.yml
             rm .cnb.yml

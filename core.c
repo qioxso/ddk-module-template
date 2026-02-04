@@ -7,95 +7,154 @@
 #include <linux/device.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
-#include <linux/ptrace.h>
 #include <linux/sched/mm.h>
 #include <linux/version.h>
+#include <linux/pid.h>
 
-// 假设这些宏定义在你的 comm.h 中，如果没有请手动添加
+#include "comm.h" // 确保和用户态是同一个头文件
+
 #define DEVICE_NAME "shami"
-#define OP_READ_MEM  0x101
-#define OP_WRITE_MEM 0x102
-#define OP_MODULE_BASE 0x103
 
-typedef struct {
-    int pid;
-    uintptr_t addr;
-    void* buffer;
-    size_t size;
-} COPY_MEMORY;
-
-// --- 核心：物理内存写入 (针对 ARM64 优化) ---
-static int force_write_memory_safe(struct mm_struct *mm, unsigned long addr, void *data, size_t size) {
+// --- 辅助函数：GUP 强力读取 (穿透 XOM/只读限制) ---
+// 这个函数手动解析页表并映射，比 access_process_vm 更底层
+static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
     struct page *page;
     void *maddr;
     int res;
+    size_t bytes_read = 0;
+    
+    while (bytes_read < size) {
+        // 计算当前页剩余可读长度
+        size_t offset = (addr + bytes_read) & ~PAGE_MASK;
+        size_t bytes_to_copy = min(size - bytes_read, PAGE_SIZE - offset);
 
-    // 使用系统标准函数获取页面，避免手动解析页表触发 CFI
-    res = get_user_pages_remote(mm, addr, 1, FOLL_WRITE | FOLL_FORCE, &page, NULL, NULL);
-    if (res <= 0) return -1;
+        // FOLL_FORCE: 强制读取 (哪怕是 Execute-Only 也能读)
+        // FOLL_REMOTE: 远程进程
+        res = get_user_pages_remote(mm, addr + bytes_read, 1, FOLL_FORCE, &page, NULL, NULL);
+        
+        if (res <= 0) {
+            // 如果读不到，尝试打印错误以便调试
+            printk(KERN_ERR "[Shami] GUP failed at %lx, ret: %d\n", addr + bytes_read, res);
+            return -1;
+        }
 
-    maddr = kmap_atomic(page);
-    memcpy(maddr + (addr & ~PAGE_MASK), data, size);
-    kunmap_atomic(maddr);
-
-    set_page_dirty_lock(page);
-    put_page(page);
+        // 临时映射物理页到内核空间
+        maddr = kmap_atomic(page);
+        memcpy(buffer + bytes_read, maddr + offset, bytes_to_copy);
+        kunmap_atomic(maddr);
+        
+        // 释放页面引用
+        put_page(page);
+        
+        bytes_read += bytes_to_copy;
+    }
     return 0;
 }
 
-// --- IOCTL 处理函数 ---
+// --- 辅助函数：GUP 强力写入 ---
+static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *data, size_t size) {
+    struct page *page;
+    void *maddr;
+    int res;
+    size_t bytes_written = 0;
+
+    while (bytes_written < size) {
+        size_t offset = (addr + bytes_written) & ~PAGE_MASK;
+        size_t bytes_to_copy = min(size - bytes_written, PAGE_SIZE - offset);
+
+        // FOLL_WRITE | FOLL_FORCE: 强制获取可写权限
+        res = get_user_pages_remote(mm, addr + bytes_written, 1, FOLL_WRITE | FOLL_FORCE, &page, NULL, NULL);
+        if (res <= 0) {
+             printk(KERN_ERR "[Shami] GUP Write failed at %lx\n", addr + bytes_written);
+             return -1;
+        }
+
+        maddr = kmap_atomic(page);
+        memcpy(maddr + offset, data + bytes_written, bytes_to_copy);
+        kunmap_atomic(maddr);
+        
+        set_page_dirty_lock(page);
+        put_page(page);
+        bytes_written += bytes_to_copy;
+    }
+    return 0;
+}
+
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    COPY_MEMORY cm;
     struct task_struct *task;
     struct pid *pid_struct;
     struct mm_struct *mm;
+    long ret = -EINVAL;
+    COPY_MEMORY cm;
+    void *kbuf = NULL;
 
-    if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
+    // 统一处理 copy_from_user
+    if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
+        if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
+        
+        // --- 调试打印 (非常重要) ---
+        // 让我们看看内核到底收到了什么地址
+        if (cmd == OP_READ_MEM) {
+             // 限制打印频率，避免刷屏，但在调试阶段很有用
+             printk(KERN_INFO "[Shami] CMD_READ: pid=%d addr=%lx size=%lu\n", cm.pid, (unsigned long)cm.addr, cm.size);
+        }
 
-    pid_struct = find_get_pid(cm.pid);
-    if (!pid_struct) return -ESRCH;
-    task = get_pid_task(pid_struct, PIDTYPE_PID);
-    put_pid(pid_struct);
-    if (!task) return -ESRCH;
-
-    mm = get_task_mm(task);
-    if (!mm) {
-        put_task_struct(task);
-        return -ENOMEM;
+        kbuf = kmalloc(cm.size, GFP_KERNEL);
+        if (!kbuf) return -ENOMEM;
     }
 
     switch (cmd) {
-        case OP_READ_MEM:
-            // 正常的读取可以使用 access_process_vm
-            {
-                void *kbuf = kmalloc(cm.size, GFP_KERNEL);
-                if (access_process_vm(task, cm.addr, kbuf, cm.size, 0) == cm.size) {
-                    copy_to_user(cm.buffer, kbuf, cm.size);
+        case OP_READ_MEM: {
+            pid_struct = find_get_pid(cm.pid);
+            if (pid_struct) {
+                task = get_pid_task(pid_struct, PIDTYPE_PID);
+                if (task) {
+                    mm = get_task_mm(task);
+                    if (mm) {
+                        // 使用我们新的 强力读取 函数
+                        if (read_memory_force(mm, cm.addr, kbuf, cm.size) == 0) {
+                            if (copy_to_user(cm.buffer, kbuf, cm.size)) ret = -EFAULT;
+                            else ret = 0;
+                        } else {
+                            // 读取失败
+                            printk(KERN_ERR "[Shami] Read failed internally\n");
+                        }
+                        mmput(mm);
+                    }
+                    put_task_struct(task);
                 }
-                kfree(kbuf);
+                put_pid(pid_struct);
             }
-            break;
-        case OP_WRITE_MEM:
-            // 使用我们修改后的强制写入
-            {
-                void *kbuf = kmalloc(cm.size, GFP_KERNEL);
-                if (!copy_from_user(kbuf, cm.buffer, cm.size)) {
-                    force_write_memory_safe(mm, cm.addr, kbuf, cm.size);
+        } break;
+
+        case OP_WRITE_MEM: {
+            if (copy_from_user(kbuf, cm.buffer, cm.size)) {
+                kfree(kbuf); return -EFAULT;
+            }
+            pid_struct = find_get_pid(cm.pid);
+            if (pid_struct) {
+                task = get_pid_task(pid_struct, PIDTYPE_PID);
+                if (task) {
+                    mm = get_task_mm(task);
+                    if (mm) {
+                        if (write_memory_force(mm, cm.addr, kbuf, cm.size) == 0) ret = 0;
+                        mmput(mm);
+                    }
+                    put_task_struct(task);
                 }
-                kfree(kbuf);
+                put_pid(pid_struct);
             }
-            break;
+        } break;
     }
 
-    mmput(mm);
-    put_task_struct(task);
-    return 0;
+    if (kbuf) kfree(kbuf);
+    return ret;
 }
 
-// --- 字符设备驱动框架 ---
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = shami_ioctl,
+    .compat_ioctl = shami_ioctl,
 };
 
 static int major;
@@ -103,11 +162,10 @@ static struct class *shami_class;
 
 static int __init shami_init(void) {
     major = register_chrdev(0, DEVICE_NAME, &fops);
+    if (major < 0) return major;
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    
-    // 强制修改 /dev/shami 权限为 0666，方便用户态访问
-    printk(KERN_INFO "[Shami] Loaded. Device at /dev/%s\n", DEVICE_NAME);
+    printk(KERN_INFO "[Shami] Driver Loaded with Force GUP support.\n");
     return 0;
 }
 
@@ -115,7 +173,6 @@ static void __exit shami_exit(void) {
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
-    printk(KERN_INFO "[Shami] Unloaded.\n");
 }
 
 module_init(shami_init);
